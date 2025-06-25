@@ -358,6 +358,7 @@ def main():
     parser.add_argument("--dcfilter", action='store_true', help="Use an alternate filter to identify DNS record types")
     parser.add_argument("--sslprotocol", help="SSL version for LDAP connection, can be SSLv23, TLSv1, TLSv1_1 or TLSv1_2")
     parser.add_argument("--outfile", default='records.csv', help="Output file name/path (default: records.csv)")
+    parser.add_argument("--hosts", action='store_true', help="Format output in hosts file style")
 
     args = parser.parse_args()
     #Prompt for password if not set
@@ -500,6 +501,22 @@ def main():
 
             continue
     print_o(f'Found {len(outdata)} records, saving to {args.outfile}')
+    if args.hosts:
+        with codecs.open(args.outfile, 'w', 'utf-8') as outfile:
+            for row in outdata:
+                if row['type'] == 'A':
+                    ip_address = row['value']
+                    hostname = row['name'].upper()
+                    fqdn = f"{hostname}.{zone}"
+                    if hostname == '@': # domain root
+                        outfile.write(f"{ip_address} {zone}")
+                        continue
+                    elif hostname == 'DOMAINDNSZONES': # domain root
+                        continue
+                    else:
+                        outfile.write(f"{ip_address} {fqdn} {hostname}\n")
+        return
+
     with codecs.open(args.outfile, 'w', 'utf-8') as outfile:
         outfile.write('type,name,value\n')
         for row in outdata:
