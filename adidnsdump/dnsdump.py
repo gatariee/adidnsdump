@@ -32,12 +32,16 @@ import socket
 import codecs
 from struct import unpack, pack
 from impacket.structure import Structure
-from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, Tls
+from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, Tls, KERBEROS
 import ldap3
 from impacket.ldap import ldaptypes
+from impacket.krb5.ccache import CCache
 import dns.resolver
 import dns.name
 import datetime
+import os
+import tempfile
+import atexit
 
 def print_m(string):
     sys.stderr.write('\033[94m[-]\033[0m %s\n' % (string))
@@ -334,6 +338,43 @@ RECORD_TYPE_MAPPING = {
     33: 'SRV'
 }
 
+def tmp_krb5(realm, kdc_host, domain):
+    """
+    Very lazy way to handle GSSAPI Kerberos authentication. Please forgive me.
+    """
+    krb5_conf_content = f"""
+[libdefaults]
+    dns_lookup_kdc = false
+    dns_lookup_realm = false
+    default_realm = {realm.upper()}
+
+[realms]
+    {realm} = {{
+        kdc = {kdc_host}
+        admin_server = {kdc_host}
+    }}
+
+[domain_realm]
+    .{domain} = {realm.upper()}
+    {domain} = {realm.upper()}
+"""
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".conf", mode='w', encoding='utf-8')
+    tmp_file.write(krb5_conf_content.strip())
+    tmp_file.close()
+
+    os.environ['KRB5_CONFIG'] = os.path.abspath(tmp_file.name)
+
+    # Register for cleanup
+    def cleanup():
+        try:
+            if tmp_file.name and os.path.exists(tmp_file.name):
+                os.remove(os.path.abspath(tmp_file.name))
+        except FileNotFoundError:
+            pass
+
+    atexit.register(cleanup)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Query/modify DNS records for Active Directory integrated DNS via LDAP')
     parser._optionals.title = "Main options"
@@ -344,6 +385,11 @@ def main():
     parser.add_argument("host",metavar='HOSTNAME',help="Hostname/ip or ldap://host:port connection string to connect to")
     parser.add_argument("-u","--user",metavar='USERNAME',help="DOMAIN\\username for authentication.")
     parser.add_argument("-p","--password",metavar='PASSWORD',help="Password or LM:NTLM hash, will prompt if not specified")
+    parser.add_argument('-k', '--kerberos', action="store_true", help='Use Kerberos authentication. Grabs credentials from ccache file '
+                        '(KRB5CCNAME) based on target parameters. If valid credentials '
+                        'cannot be found, it will use the ones specified in the command '
+                        'line')
+    parser.add_argument('-no-pass', action="store_true", help="Don't ask for password (useful for -k)")
     parser.add_argument("--forest", action='store_true', help="Search the ForestDnsZones instead of DomainDnsZones")
     parser.add_argument("--legacy", action='store_true', help="Search the System partition (legacy DNS storage)")
     parser.add_argument("--zone", help="Zone to search in (if different than the current domain)")
@@ -368,23 +414,60 @@ def main():
         if not '\\' in args.user:
             print_f('Username must include a domain, use: DOMAIN\\username')
             sys.exit(1)
+        if args.password is None and not args.no_pass:
+            args.password = getpass.getpass()
+
+    # Handling Kerberos authentication
+    if args.kerberos:
+        print_m("Kerberos authentication enabled")
+        authentication = 'SASL'
+        sasl_mech = KERBEROS
+
+        # Check for Kerberos ticket cache
+        if 'KRB5CCNAME' in os.environ and os.path.exists(os.environ['KRB5CCNAME']):
+            print_m(f"Using Kerberos ticket: {os.environ['KRB5CCNAME']}")
+
+            if args.user is None:
+                # If no user is specified, we can get the user from the ccache
+                try:
+                    ccache  = CCache.loadFile(os.environ['KRB5CCNAME'])
+                    domain  = ccache.principal.realm['data'].decode('utf-8').upper()
+                    user    = ccache.principal.components[0]['data'].decode('utf-8')
+
+                    print_m(f"Using user {user} from Kerberos ticket cache")
+                    print_m(f"Using domain {domain} from Kerberos ticket cache")
+
+                except Exception as e:
+                    print_f(f"Failed to load Kerberos ticket cache: {e}")
+                    sys.exit(1)
+            else:
+                domain = args.user.split('\\')[0].upper()
+                user = args.user.split('\\')[1]
+
+            # Set the KRB5_CONFIG environment variable if not already set
+            if 'KRB5_CONFIG' not in os.environ:
+                try:
+                    tmp_krb5(domain, args.host, domain)
+                except Exception as e:
+                    print_f(f"Failed to create temporary krb5.conf: {e}")
+                    sys.exit(1)
+
+        else:
+            print_f("Kerberos ticket cache not found or invalid.")
+            sys.exit(1)
+
+    else:
+        print_m("Using NTLM authentication.")
+        authentication = NTLM
+        sasl_mech = None
         if args.password is None:
             args.password = getpass.getpass()
 
-    # define the server and the connection
-    s = Server(args.host, get_info=ALL)
-    if args.ssl:
-        s = Server(args.host, get_info=ALL, port=636, use_ssl=True)
-    if args.sslprotocol:
-        v = {'SSLv23' : 2, 'TLSv1' : 3, 'TLSv1_1' : 4, 'TLSv1_2' : 5}
-        if args.sslprotocol not in v.keys():
-            parser.print_help(sys.stderr)
-            sys.exit(1)
-        s = Server(args.host, get_info=ALL, port=636, use_ssl=True, tls=Tls(validate=0, version=v[args.sslprotocol]) )
-    if args.referralhosts:
-        s.allowed_referral_hosts = [('*', True)]
+    # Define the server and connection
+    s = Server(args.host, get_info=ALL, use_ssl=args.ssl)
     print_m('Connecting to host...')
-    c = Connection(s, user=args.user, password=args.password, authentication=authentication, auto_referrals=False)
+    c = Connection(s, user=args.user, password=args.password, authentication=authentication, sasl_mechanism=sasl_mech)
+
     print_m('Binding to host')
     # perform the Bind operation
     if not c.bind():
